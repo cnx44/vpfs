@@ -52,3 +52,38 @@ cargo run --bin conflict_resolver [-- options]
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-p, --port <port>` | Port to listen on for connections from the local daemon. Must match the daemon's `--conflict-port`. | `8083` |
+
+## Architecture
+
+```
+client programs ──TCP──> gateway ─────┐
+other daemons ──iroh──> peer_handler ─┴─> service ──> executor ──> state
+                                           │                         ├─ namespace  (path -> FileEntry)
+                                           ├─> transport (peers)     ├─ logbook    (log + vector clock)
+                                           └─> human (resolver)      ├─ cache      (LRU copies of remote files)
+                                                                     └─ blobs      (content on disk)
+```
+
+| Module (`src/daemon/`) | Responsibility |
+|---|---|
+| `gateway.rs`, `peer_handler.rs` | Decode requests from clients / other daemons, call the service. No logic. |
+| `service.rs` | Route each operation: local state (via executor) or the owner node (via transport); deliver effects. |
+| `executor.rs` | Task queue owning the state. The only place that decides how tasks are scheduled. |
+| `state.rs` | The only code that changes the node's state. Local ops and remote events converge here. |
+| `content.rs` | Write policy per `FileKind` (`Blob`: replace only; `Text`: `InsertAt`/`DeleteAt`). |
+| `conflict.rs` | Conflict heuristics per kind; unresolved conflicts quarantine the path until a human decides. |
+| `transport.rs`, `membership.rs` | Delivery to peers (`fetch`, `broadcast`) and join/hello handshakes. |
+
+Shared with clients (`src/`): `messages.rs` (all wire and on-disk types), `framing.rs`, `client.rs`, `ffi.rs`.
+
+## Testing
+
+`legacy/` is a frozen copy of the pre-refactor implementation, kept as a behavioural oracle.
+The e2e suites in `tests/` compile against both; assertions on behaviour fixed by the refactor branch on `LEGACY`.
+
+```sh
+cargo test                                   # current implementation
+cargo test --manifest-path legacy/Cargo.toml # oracle
+```
+
+Two-node tests need network access (iroh discovery).
