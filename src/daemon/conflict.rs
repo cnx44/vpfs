@@ -13,6 +13,7 @@ use vpfs::messages::{FileEntry, FileKind, LogEntry, LogOp};
 
 #[derive(Clone, Debug)]
 pub struct Conflict {
+    /// The path both entries touch; also the quarantine key.
     pub path: String,
     /// What this node currently has.
     pub local: LogEntry,
@@ -25,6 +26,8 @@ pub trait ConflictHeuristic: Sync {
     fn resolve(&self, conflict: &Conflict) -> Option<FileEntry>;
 }
 
+/// Heuristics for a kind, tried in order; the first `Some` wins. Only the
+/// designated resolver runs them (`State::on_conflict`).
 pub fn heuristics_for(kind: FileKind) -> &'static [&'static dyn ConflictHeuristic] {
     match kind {
         FileKind::Blob | FileKind::Text => &[&SameVersion],
@@ -33,11 +36,15 @@ pub fn heuristics_for(kind: FileKind) -> &'static [&'static dyn ConflictHeuristi
 
 /// The node that must resolve `conflict`: the greatest author name. Any rule
 /// works as long as every node computes the same answer.
+/// Every node that sees the conflict computes it: the chosen one resolves,
+/// the others only quarantine the path.
 pub fn designated_resolver(conflict: &Conflict) -> &str {
     conflict.local.node.as_str().max(conflict.remote.node.as_str())
 }
 
 /// Both sides did the same create/modify: nothing to choose.
+/// Remove is excluded: the resolution is committed as a `Modify`, which would
+/// bring the removed file back.
 struct SameVersion;
 
 impl ConflictHeuristic for SameVersion {

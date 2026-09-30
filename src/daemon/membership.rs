@@ -14,15 +14,19 @@ use iroh::{Endpoint, EndpointAddr, PublicKey};
 use vpfs::framing::{recv_msg, send_msg};
 use vpfs::messages::{Hello, HelloResponse, VPFSNode};
 
+/// Protocol id of every VPFS iroh connection; the router accepts only this one.
 pub const ALPN: &[u8] = b"uic/vpfs";
 
 #[derive(Debug)]
 pub struct Membership {
+    /// This node.
     pub local: VPFSNode,
-    known: Mutex<HashMap<String, PublicKey>>, // node name -> endpoint id
+    /// Node name -> endpoint id, for every other node we have heard of.
+    known: Mutex<HashMap<String, PublicKey>>,
 }
 
 impl Membership {
+    /// Only this node, which is never in `known`.
     pub fn new(local: VPFSNode) -> Membership {
         Membership { local, known: Mutex::new(HashMap::new()) }
     }
@@ -36,6 +40,10 @@ impl Membership {
     }
 
     /// Join the network through `remote`. Returns `remote`'s node name.
+    /// Sends every node we know (plus ourselves) and merges the answer, so `known`
+    /// then holds the network as `remote` sees it. The connection is used only for
+    /// this handshake. Called at startup with `--remote-id`. `None` if the
+    /// connection or the handshake fails.
     pub async fn join(&self, endpoint: &Endpoint, remote: PublicKey) -> Option<String> {
         println!("Connecting to root node: {}", remote);
         let conn = match endpoint.connect(EndpointAddr::new(remote), ALPN).await {
@@ -64,6 +72,8 @@ impl Membership {
     }
 
     /// Open the connection used for all traffic with `name`.
+    /// The `DaemonHello` tells the other side our name, so it uses the same
+    /// connection for its requests to us. Called by `PeerHandler::connect_all`.
     pub async fn dial(&self, endpoint: &Endpoint, name: &str, id: PublicKey) -> Option<Connection> {
         println!("Connecting to node: {} ({})", name, id);
         let conn = endpoint.connect(EndpointAddr::new(id), ALPN).await
@@ -77,6 +87,7 @@ impl Membership {
         }
     }
 
+    /// Send one hello on a fresh stream of `conn` and read the response.
     async fn handshake(conn: &Connection, hello: Hello) -> Option<HelloResponse> {
         let (mut send, mut recv) = conn.open_bi().await
             .map_err(|e| eprintln!("Error opening bi-directional stream: {}", e)).ok()?;
@@ -86,6 +97,10 @@ impl Membership {
 
     /// Answer the hello on an incoming connection. Returns the node name if the
     /// connection is a `dial` from that node (so it can carry our requests too).
+    /// * `DaemonHello`: record the node, answer, return its name.
+    /// * `InitHello`: answer with the nodes we knew before (plus us), then add the
+    ///   newcomers; `None`, since the joiner will `dial` us afterwards.
+    /// * `ClientHello` or a broken stream: `Err`, the connection is dropped.
     pub async fn on_hello(&self, conn: &Connection) -> Result<Option<String>, ()> {
         let remote_id = conn.remote_id();
         let (mut send, mut recv): (SendStream, RecvStream) = conn.accept_bi().await.map_err(|_| ())?;

@@ -32,10 +32,12 @@ const BROADCAST_TIMEOUT: Duration = Duration::from_secs(3);
 /// Iroh (QUIC) transport: one connection per node, one bi-directional stream per request.
 #[derive(Debug, Default)]
 pub struct IrohTransport {
+    /// Node name -> connection adopted by peer_handler.rs. These nodes are the broadcast targets.
     connections: Mutex<HashMap<String, Connection>>,
 }
 
 impl IrohTransport {
+    /// Called by `PeerHandler::adopt`; replaces any previous connection to `node`.
     pub fn register(&self, node: &str, conn: Connection) {
         self.connections.lock().unwrap().insert(node.to_string(), conn);
     }
@@ -53,6 +55,7 @@ impl IrohTransport {
         }
     }
 
+    /// One request on a fresh bi-directional stream, then its one response.
     async fn exchange(conn: &Connection, req: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
         let (mut send, mut recv) = conn.open_bi().await?;
         send_msg(&mut send, req).await?;
@@ -72,6 +75,8 @@ impl Transport for IrohTransport {
         })
     }
 
+    /// Nodes are contacted one after the other, so the worst case is
+    /// `BROADCAST_TIMEOUT` per unresponsive node.
     fn broadcast<'a>(&'a self, events: Vec<LogEntry>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let nodes: Vec<String> = self.connections.lock().unwrap().keys().cloned().collect();

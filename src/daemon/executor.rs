@@ -16,12 +16,15 @@ use super::state::{Effects, State};
 
 type Task = Box<dyn FnOnce(&mut State) + Send>;
 
+/// Handle to the task queue; cheap to clone. The state itself is owned by the worker thread.
 #[derive(Clone)]
 pub struct Executor {
     queue: mpsc::Sender<Task>,
 }
 
 impl Executor {
+    /// Move `state` into a dedicated OS thread that runs tasks in submission order.
+    /// Called once in `main`.
     pub fn spawn(mut state: State) -> Executor {
         let (queue, tasks) = mpsc::channel::<Task>();
         thread::spawn(move || {
@@ -34,6 +37,8 @@ impl Executor {
     }
 
     /// Run `f` on the state; returns its result and the effects it produced.
+    /// Effects are taken right after `f`, so they belong to this task only.
+    /// If `f` panics, the node survives but this call panics in the caller.
     pub async fn run<R: Send + 'static>(&self, f: impl FnOnce(&mut State) -> R + Send + 'static) -> (R, Effects) {
         let (reply, result) = oneshot::channel();
         let task: Task = Box::new(move |state| {

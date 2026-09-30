@@ -11,9 +11,12 @@
 use vpfs::messages::{FileKind, Mutation, VPFSError};
 
 pub trait ContentPolicy: Sync {
+    /// New content from the old `content` and `mutations`, applied in order.
+    /// No side effects: on `Err` the caller stores nothing.
     fn apply(&self, content: Vec<u8>, mutations: &[Mutation]) -> Result<Vec<u8>, VPFSError>;
 }
 
+/// The policy for `kind`. Only caller: `State::write`, the single write path.
 pub fn policy_for(kind: FileKind) -> &'static dyn ContentPolicy {
     match kind {
         FileKind::Blob => &BlobPolicy,

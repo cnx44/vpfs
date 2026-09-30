@@ -16,9 +16,13 @@ use super::transport::Transport;
 use vpfs::messages::*;
 
 pub struct Service {
+    /// This node's name.
     pub me: String,
+    /// The only way to reach `State`.
     executor: Executor,
+    /// Requests and broadcasts to other nodes.
     transport: Arc<dyn Transport>,
+    /// Conflicts for the human resolver thread (human.rs).
     human: mpsc::Sender<Conflict>,
 }
 
@@ -32,6 +36,8 @@ impl Service {
     }
 
     /// Run a task on the state, then deliver its effects.
+    /// The broadcast is awaited, so the caller answers its client only after the
+    /// peers acked or timed out (see `BROADCAST_TIMEOUT` in transport.rs).
     async fn exec<R: Send + 'static>(&self, f: impl FnOnce(&mut State) -> R + Send + 'static) -> R {
         let (result, effects) = self.executor.run(f).await;
         if !effects.events.is_empty() {
@@ -53,14 +59,22 @@ impl Service {
 
     // ---- namespace ---------------------------------------------------------------
 
+    /// Resolve `path` in the local namespace. Never uses the network: every node
+    /// holds the whole namespace.
     pub async fn find(&self, path: String) -> Result<FileEntry, VPFSError> {
         self.exec(move |s| s.find(&path)).await
     }
 
+    /// The whole namespace (there is no directory filter).
     pub async fn list(&self) -> Vec<FileEntry> {
         self.exec(|s| s.list()).await
     }
 
+    /// Create a file at `path` whose content lives on `owner` (possibly another node):
+    /// check the path is free, allocate an empty blob on the owner (`Allocate` if
+    /// remote), then record the `Create` here and broadcast it. The entry is created
+    /// by the node the client talks to, not by the owner. If the final `create`
+    /// fails (path taken meanwhile), the allocated blob is left unused.
     pub async fn place(&self, path: String, owner: String, kind: FileKind) -> Result<FileEntry, VPFSError> {
         let p = path.clone();
         if let Ok(existing) = self.exec(move |s| s.find(&p)).await {
@@ -80,6 +94,10 @@ impl Service {
 
     // ---- content -----------------------------------------------------------------
 
+    /// Whole content of `file`. Owned files are read from disk. Remote ones are
+    /// fetched from the owner (sending our copy's time as `if_modified_since`) and
+    /// cached. If the owner is unreachable: `OnlyInCache(copy)`, which the client
+    /// can read or write locally.
     pub async fn read(&self, file: FileEntry) -> Result<Vec<u8>, VPFSError> {
         if file.owner == self.me {
             return self.exec(move |s| s.read(&file.uri, None)).await.map(Option::unwrap_or_default);
@@ -107,6 +125,8 @@ impl Service {
     }
 
     /// Change the content of `file`; runs on the owner. Returns the new size.
+    /// If the owner is unreachable: `OnlyInCache(copy)`. Writing that copy (its
+    /// owner is this node) makes this node the owner, see `State::write`.
     pub async fn write(&self, file: FileEntry, mutations: Vec<Mutation>) -> Result<usize, VPFSError> {
         if file.owner == self.me {
             return self.exec(move |s| s.write(file, &mutations)).await;
@@ -122,6 +142,8 @@ impl Service {
 
     // ---- fd api: the fd lives on the owner ------------------------------------------
 
+    /// Open `file` on its owner; returns the owner's fd, which the client pairs
+    /// with the owner's name. No cache fallback.
     pub async fn open(&self, file: FileEntry) -> Result<i32, VPFSError> {
         if file.owner == self.me {
             return self.exec(move |s| s.open_fd(&file.uri)).await;
@@ -132,6 +154,7 @@ impl Service {
         }
     }
 
+    /// Up to `len` bytes from an fd opened on `owner`; empty at end of file.
     pub async fn read_fd(&self, owner: String, fd: i32, len: usize) -> Result<Vec<u8>, VPFSError> {
         if owner == self.me {
             return self.exec(move |s| s.read_fd(fd, len)).await;
@@ -142,6 +165,7 @@ impl Service {
         }
     }
 
+    /// Next line from an fd opened on `owner`.
     pub async fn read_line_fd(&self, owner: String, fd: i32) -> Result<Vec<u8>, VPFSError> {
         if owner == self.me {
             return self.exec(move |s| s.read_line_fd(fd)).await;
@@ -152,6 +176,7 @@ impl Service {
         }
     }
 
+    /// Close an fd opened on `owner`.
     pub async fn close(&self, owner: String, fd: i32) -> Result<(), VPFSError> {
         if owner == self.me {
             return self.exec(move |s| s.close_fd(fd)).await;
@@ -164,7 +189,8 @@ impl Service {
 
     // ---- replication -------------------------------------------------------------
 
-    /// Answer a request from another node.
+    /// Answer a request from another node (peer_handler.rs).
+    /// `Write` goes through `self.write`, so it is forwarded if we are not the owner.
     pub async fn serve_peer(&self, req: DaemonRequest) -> DaemonResponse {
         match req {
             DaemonRequest::Allocate => DaemonResponse::Allocated(self.exec(|s| s.allocate()).await),
@@ -189,6 +215,7 @@ impl Service {
     }
 
     /// First join of a new node: take the namespace as `node` sees it.
+    /// Called in `main` only when `./files` was just created.
     pub async fn bootstrap_from(&self, node: &str) {
         match self.transport.fetch(node, DaemonRequest::Snapshot).await {
             Ok(DaemonResponse::Snapshot(snapshot)) => self.exec(move |s| s.merge_snapshot(snapshot)).await,
@@ -198,6 +225,7 @@ impl Service {
 
     /// Exchange the log entries each side missed while apart. Our side goes
     /// through the same path as live events; conflicts are resolved later.
+    /// Called in `main` on every start with `--remote-id`, only with that node.
     pub async fn sync_with(&self, node: &str) {
         let ours = self.exec(|s| s.clock()).await;
         let (theirs, their_clock) = match self.transport.fetch(node, DaemonRequest::LogSince(ours)).await {
@@ -211,7 +239,7 @@ impl Service {
         }
     }
 
-    /// A human settled a conflict.
+    /// A human settled a conflict (called by human.rs).
     pub async fn resolve(&self, path: String, chosen: FileEntry) {
         self.exec(move |s| s.resolve(&path, chosen)).await
     }

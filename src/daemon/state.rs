@@ -37,19 +37,29 @@ pub struct Effects {
 }
 
 pub struct State {
+    /// This node's name.
     pub me: String,
+    /// Content of owned files and cached copies.
     blobs: Blobs,
+    /// Path -> current metadata.
     namespace: Namespace,
+    /// Log, vector clock and per-path heads.
     logbook: Logbook,
+    /// Copies of remote files.
     cache: Cache,
+    /// Fds opened by the fd api on this node's blobs, for local or remote
+    /// clients; the key is the OS fd. Lost on restart.
     open_files: HashMap<i32, File>,
     /// Paths in an unresolved conflict -> the concurrent entries competing with the head.
     quarantine: HashMap<String, Vec<LogEntry>>,
+    /// Collected during the current task; the executor takes them afterwards.
     effects: Effects,
 }
 
 impl State {
     /// Load the node's state from `dir` (empty if the files are missing).
+    /// Called once in `main`, then moved into the executor.
+    /// Quarantine and open fds are not persisted: they start empty.
     pub fn open(dir: &Path, me: &str, max_cache_size: usize) -> State {
         State {
             me: me.to_string(),
@@ -63,12 +73,14 @@ impl State {
         }
     }
 
+    /// Called by the executor after every task.
     pub fn take_effects(&mut self) -> Effects {
         std::mem::take(&mut self.effects)
     }
 
     // ---- namespace queries ---------------------------------------------------
 
+    /// Namespace lookup; `DoesNotExist` if the path is unknown.
     pub fn find(&self, path: &str) -> Result<FileEntry, VPFSError> {
         self.namespace.get(path).cloned().ok_or(VPFSError::DoesNotExist)
     }
@@ -78,18 +90,22 @@ impl State {
         self.namespace.list()
     }
 
+    /// Namespace copy for a joining node (`DaemonRequest::Snapshot`).
     pub fn snapshot(&self) -> HashMap<String, FileEntry> {
         self.namespace.snapshot()
     }
 
+    /// Bootstrap of a new node; bypasses the log (see `Namespace::merge_snapshot`).
     pub fn merge_snapshot(&mut self, snapshot: HashMap<String, FileEntry>) {
         self.namespace.merge_snapshot(snapshot);
     }
 
+    /// Our vector clock, sent in `LogSince`.
     pub fn clock(&self) -> Clock {
         self.logbook.clock().clone()
     }
 
+    /// Entries `clock` has not seen, plus our clock (the answer to `LogSince`).
     pub fn log_since(&self, clock: &Clock) -> (Vec<LogEntry>, Clock) {
         (self.logbook.since(clock), self.logbook.clock().clone())
     }
@@ -101,6 +117,9 @@ impl State {
         self.blobs.create()
     }
 
+    /// Record a new file. `AlreadyExists` if the path is taken here. Does not check
+    /// the blob on the owner. Two nodes creating the same path at the same time
+    /// is detected later, as a conflict.
     pub fn create(&mut self, entry: FileEntry) -> Result<FileEntry, VPFSError> {
         if let Some(existing) = self.namespace.get(&entry.name) {
             return Err(VPFSError::AlreadyExists(existing.clone()));
@@ -112,6 +131,8 @@ impl State {
     /// The single write path: every change to the content of a file this node
     /// owns ends here, whether it came from a local client or from a peer.
     /// Returns the size of the new content.
+    /// `entry` must equal the namespace entry exactly (or be our cached copy): an
+    /// entry from before a change of uri, owner or name is refused with `DoesNotExist`.
     pub fn write(&mut self, mut entry: FileEntry, mutations: &[Mutation]) -> Result<usize, VPFSError> {
         if self.quarantine.contains_key(&entry.name) {
             return Err(VPFSError::Conflicted(entry.name));
@@ -145,6 +166,7 @@ impl State {
     // ---- cache -----------------------------------------------------------------
 
     /// Our copy of a remote file, as an entry readable locally, and when it was stored.
+    /// The entry's owner is this node, so a client can read it or write it (taking ownership).
     pub fn cached(&self, path: &str) -> Option<(FileEntry, Option<SystemTime>)> {
         let copy = self.cache.peek(path)?;
         let kind = self.namespace.get(path).map(|e| e.kind).unwrap_or_default();
@@ -152,12 +174,14 @@ impl State {
         Some((entry, self.blobs.modified(&copy.uri)))
     }
 
+    /// Store fresh content fetched from the owner (see `Cache::store`).
     pub fn cache_store(&mut self, file: &FileEntry, data: &[u8]) {
         self.cache.store(&self.blobs, file, data);
     }
 
     // ---- open files (fd api) ---------------------------------------------------
 
+    /// Open a local blob for reading; the OS fd number is the handle.
     pub fn open_fd(&mut self, uri: &str) -> Result<i32, VPFSError> {
         let file = self.blobs.open(uri).map_err(|_| VPFSError::DoesNotExist)?;
         let fd = file.as_raw_fd();
@@ -189,13 +213,16 @@ impl State {
         Ok(line)
     }
 
+    /// Forget the fd (closing the file). `FileNotOpen` if unknown.
     pub fn close_fd(&mut self, fd: i32) -> Result<(), VPFSError> {
         self.open_files.remove(&fd).map(|_| ()).ok_or(VPFSError::FileNotOpen)
     }
 
     // ---- replication -----------------------------------------------------------
 
-    /// Apply entries recorded by other nodes.
+    /// Apply entries recorded by other nodes: broadcast events and `sync_with`.
+    /// Every entry is logged. Only `Newer` ones change the namespace, and they lift
+    /// any quarantine on their path. `Concurrent` ones go to `on_conflict`.
     pub fn apply_remote(&mut self, entries: Vec<LogEntry>) {
         for entry in entries {
             match self.arrival(&entry) {
@@ -235,6 +262,10 @@ impl State {
         arrival
     }
 
+    /// A concurrent entry arrived. On an already quarantined path it just joins
+    /// the competitors. Otherwise the designated node tries the heuristics and, if
+    /// none decides, hands the conflict to a human; every node that did not settle
+    /// it with a heuristic quarantines the path.
     fn on_conflict(&mut self, conflict: Conflict) {
         println!("Conflict (concurrent) for file: {}", conflict.path);
         if let Some(competing) = self.quarantine.get_mut(&conflict.path) {

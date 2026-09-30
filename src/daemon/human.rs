@@ -15,9 +15,14 @@ use super::service::Service;
 use vpfs::framing::{recv_frame, send_frame};
 use vpfs::messages::{ConflictResolutionRequest, ConflictResolutionResponse};
 
+/// Wait between attempts to reach the resolver.
 const RETRY: Duration = Duration::from_secs(5);
 
 /// Handle conflicts from `conflicts` one at a time, until each gets an answer.
+/// While one conflict waits, the next ones wait in the channel. The resolver
+/// connection is reused; on any error it is dropped and redialled after `RETRY`.
+/// The answer goes through `Service::resolve`, which ignores it if a newer
+/// entry settled the path in the meantime.
 pub fn spawn(resolver_port: u16, conflicts: Receiver<Conflict>, service: Arc<Service>, rt: Handle) {
     thread::spawn(move || {
         let mut resolver: Option<TcpStream> = None;
